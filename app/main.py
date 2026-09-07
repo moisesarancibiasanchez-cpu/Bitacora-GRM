@@ -1,50 +1,84 @@
 """
 app.main
-Bitácora GRM — API FastAPI con los 4 endpoints críticos del enunciado:
+Bitácora GRM — API FastAPI.
+
+Endpoints críticos del enunciado:
     POST /despliegues/
     POST /despliegues/{despliegue_id}/componentes/
     POST /incidencias/
     GET  /trazabilidad/despliegues/{despliegue_id}
 
-Más endpoints auxiliares: health, listados, /docs (Swagger).
+Mejoras Tier 1 (v1.1.0):
+    - Autenticación ligera por cabecera X-User-Id (inyección de dependencias).
+    - `reportado_por_id` se toma del header, no del body.
+    - PATCH /incidencias/{id} con actualización parcial + state machine.
+    - Filtros (validados con el Enum) y paginación en listados.
+    - CORS restrictivo por entorno.
+    - Helper `require_role()` para autorización por rol.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import List
+from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Path, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
 from app.database import get_db
-from app.models import Componente, Despliegue, Incidencia, Usuario
+from app.models import (
+    Componente, Despliegue, EstadoDespliegue, EstadoIncidencia,
+    Incidencia, RolUsuario, SeveridadIncidencia, Usuario,
+)
 from app.schemas import (
-    ComponenteResponse, CrearComponente, CrearDespliegue, CrearIncidencia,
-    CrearUsuario, DespliegueResponse, HealthResponse, IncidenciaResponse,
+    ActualizarIncidencia, ComponenteResponse, CrearComponente,
+    CrearDespliegue, CrearIncidencia, CrearUsuario, DespliegueResponse,
+    HealthResponse, IncidenciaResponse, PaginatedResponse,
     TrazabilidadDespliegue, UsuarioResponse,
 )
 
 settings = get_settings()
+
+# Estados terminales de una incidencia: no admiten transiciones ni edición.
+_INCIDENCIA_ESTADOS_TERMINALES = frozenset({EstadoIncidencia.CERRADA, EstadoIncidencia.CANCELADA})
+
+# State machine: transiciones válidas de Incidencia.estado.
+# Formato: estado_actual -> {estados_permitidos}
+_TRANSICIONES_INCIDENCIA: dict[EstadoIncidencia, frozenset[EstadoIncidencia]] = {
+    EstadoIncidencia.ABIERTA:      frozenset({EstadoIncidencia.EN_ANALISIS, EstadoIncidencia.CANCELADA}),
+    EstadoIncidencia.EN_ANALISIS:  frozenset({EstadoIncidencia.EN_RESOLUCION, EstadoIncidencia.CANCELADA}),
+    EstadoIncidencia.EN_RESOLUCION: frozenset({EstadoIncidencia.RESUELTA, EstadoIncidencia.CANCELADA}),
+    EstadoIncidencia.RESUELTA:     frozenset({EstadoIncidencia.CERRADA}),
+    EstadoIncidencia.CERRADA:      frozenset(),  # terminal
+    EstadoIncidencia.CANCELADA:    frozenset(),  # terminal
+}
+
 app = FastAPI(
     title="Bitácora GRM — API",
     description=(
         "Sistema de Gestión de Despliegues e Incidencias para entorno bancario. "
         "Trazabilidad, integridad y auditoría."
     ),
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
 
+# CORS: la política se valida en app.config.Settings._cors_segun_entorno.
+# - dev: si CORS_ORIGINS no se define o vale '*', se acepta cualquier origen.
+# - staging/prod: se exige al menos un origen http(s) explícito (nunca '*').
+cors_allow_origins = (
+    ["*"] if settings.environment == "dev" else settings.cors_origins
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=cors_allow_origins,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
 
@@ -59,6 +93,117 @@ def _get_or_404(db: Session, model, obj_id: int, entity_name: str):
     return instance
 
 
+def _validar_transicion_estado(
+    actual: EstadoIncidencia, nuevo: EstadoIncidencia
+) -> None:
+    """Verifica la transición de estado permitida por la state machine."""
+    if nuevo == actual:
+        return  # idempotente
+    if actual in _INCIDENCIA_ESTADOS_TERMINALES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"La incidencia está en estado terminal '{actual.value}' "
+                f"y no admite transiciones."
+            ),
+        )
+    permitidos = _TRANSICIONES_INCIDENCIA.get(actual, frozenset())
+    if nuevo not in permitidos:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Transición de estado inválida: '{actual.value}' → '{nuevo.value}'. "
+                f"Estados permitidos desde '{actual.value}': "
+                f"{sorted(s.value for s in permitidos) or '(ninguno)'}."
+            ),
+        )
+
+
+# =====================================================================
+# Seguridad: autenticación ligera + autorización por rol
+# =====================================================================
+def get_current_user(
+    db: Session = Depends(get_db),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+) -> Usuario:
+    """
+    Resuelve el usuario actual desde la cabecera `X-User-Id`.
+    Si la cabecera falta, no es numérica o es inválida → 401.
+    Si el usuario no existe o está inactivo → 401.
+
+    Esto es deliberadamente "ligero": se asume un gateway upstream
+    (e.g. SSO corporativo) que ya validó la identidad. Aquí solo
+    se traduce la identidad a un usuario interno y se valida su estado.
+
+    Nota: usamos `str` y parseamos manualmente para que cualquier
+    valor mal formado (no numérico, negativo, etc.) devuelva SIEMPRE
+    401 (auth) y nunca 422 (validation), evitando filtrar info del
+    tipo esperado al cliente.
+    """
+    if x_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                f"Autenticación requerida. Envíe la cabecera '{settings.auth_header_name}' "
+                f"con el id del usuario."
+            ),
+            headers={"WWW-Authenticate": f"{settings.auth_header_name}"},
+        )
+    try:
+        user_id = int(x_user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                f"Valor inválido para la cabecera '{settings.auth_header_name}'. "
+                f"Debe ser un entero positivo."
+            ),
+            headers={"WWW-Authenticate": f"{settings.auth_header_name}"},
+        )
+    if user_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                f"Valor inválido para la cabecera '{settings.auth_header_name}'. "
+                f"Debe ser un entero positivo."
+            ),
+            headers={"WWW-Authenticate": f"{settings.auth_header_name}"},
+        )
+    user = db.get(Usuario, user_id)
+    if user is None or not user.activo:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario no encontrado o inactivo.",
+        )
+    return user
+
+
+def require_role(*roles: RolUsuario):
+    """
+    Fábrica de dependencias para autorización por rol.
+
+    Uso:
+        _: Usuario = Depends(require_role(RolUsuario.QA, RolUsuario.JEFE_PROYECTO))
+
+    El `_` indica que no necesitamos el objeto Usuario en el handler, solo
+    la verificación. Si necesitas el usuario, asígnalo a una variable.
+    """
+    allowed = frozenset(roles)
+
+    def _checker(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+        if current_user.rol not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Operación no permitida para el rol '{current_user.rol.value}'. "
+                    f"Roles permitidos: {sorted(r.value for r in allowed)}."
+                ),
+            )
+        return current_user
+
+    return _checker
+
+
 # =====================================================================
 # 0 · Health
 # =====================================================================
@@ -66,13 +211,14 @@ def _get_or_404(db: Session, model, obj_id: int, entity_name: str):
 def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
-        version="1.0.0",
+        version=app.version,
+        environment=settings.environment,
         timestamp=datetime.now(tz=timezone.utc),
     )
 
 
 # =====================================================================
-# 1 · POST /despliegues/
+# 1 · POST /despliegues/  (rol JEFE_PROYECTO o DESARROLLO)
 # =====================================================================
 @app.post(
     "/despliegues/",
@@ -84,6 +230,7 @@ def health() -> HealthResponse:
 def crear_despliegue(
     payload: CrearDespliegue,
     db: Session = Depends(get_db),
+    _: Usuario = Depends(require_role(RolUsuario.JEFE_PROYECTO, RolUsuario.DESARROLLO)),
 ) -> DespliegueResponse:
     _get_or_404(db, Usuario, payload.solicitante_id, "Usuario")
     _get_or_404(db, Usuario, payload.aprobador_id, "Usuario")
@@ -107,7 +254,7 @@ def crear_despliegue(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Conflicto de integridad: {exc.orig}",
+            detail="Conflicto: ya existe un despliegue con ese código o las FK son inválidas.",
         ) from exc
     db.refresh(d)
     return DespliegueResponse.model_validate(d)
@@ -127,6 +274,7 @@ def crear_componente(
     payload: CrearComponente,
     despliegue_id: int = Path(gt=0, description="ID del despliegue padre"),
     db: Session = Depends(get_db),
+    _: Usuario = Depends(require_role(RolUsuario.JEFE_PROYECTO, RolUsuario.DESARROLLO)),
 ) -> ComponenteResponse:
     _get_or_404(db, Despliegue, despliegue_id, "Despliegue")
 
@@ -153,7 +301,7 @@ def crear_componente(
 
 
 # =====================================================================
-# 3 · POST /incidencias/
+# 3 · POST /incidencias/  (cualquier usuario autenticado puede reportar)
 # =====================================================================
 @app.post(
     "/incidencias/",
@@ -165,8 +313,8 @@ def crear_componente(
 def crear_incidencia(
     payload: CrearIncidencia,
     db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
 ) -> IncidenciaResponse:
-    _get_or_404(db, Usuario, payload.reportado_por_id, "Usuario")
     if payload.asignado_a_id is not None:
         _get_or_404(db, Usuario, payload.asignado_a_id, "Usuario")
 
@@ -175,7 +323,6 @@ def crear_incidencia(
 
     if payload.componente_id is not None:
         comp = _get_or_404(db, Componente, payload.componente_id, "Componente")
-        # Regla: el componente debe pertenecer al despliegue declarado
         if comp.despliegue_id != payload.despliegue_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -190,8 +337,8 @@ def crear_incidencia(
         titulo=payload.titulo,
         descripcion=payload.descripcion,
         severidad=payload.severidad,
-        estado="ABIERTA",
-        reportado_por_id=payload.reportado_por_id,
+        estado=EstadoIncidencia.ABIERTA,
+        reportado_por_id=current_user.id,  # tomado del header, no del body
         asignado_a_id=payload.asignado_a_id,
         despliegue_id=payload.despliegue_id,
         componente_id=payload.componente_id,
@@ -203,10 +350,113 @@ def crear_incidencia(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Conflicto de integridad: {exc.orig}",
+            detail="Conflicto: ya existe una incidencia con ese código.",
         ) from exc
     db.refresh(i)
     return IncidenciaResponse.model_validate(i)
+
+
+# =====================================================================
+# 3.1 · PATCH /incidencias/{id}  (parcial + state machine)
+# =====================================================================
+@app.patch(
+    "/incidencias/{incidencia_id}",
+    response_model=IncidenciaResponse,
+    tags=["Incidencias"],
+    summary="Actualizar parcialmente una incidencia",
+)
+def actualizar_incidencia(
+    payload: ActualizarIncidencia,
+    incidencia_id: int = Path(gt=0),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+) -> IncidenciaResponse:
+    """
+    Reglas:
+    - Cualquier usuario autenticado puede editar `titulo`/`descripcion`/`severidad`
+      y cambiar la asignación a un componente/despliegue.
+    - Para cambiar `estado` o `asignado_a_id` se requiere rol QA, DESARROLLO o JEFE_PROYECTO.
+    - Las transiciones de estado siguen una state machine estricta:
+        ABIERTA       → EN_ANALISIS, CANCELADA
+        EN_ANALISIS   → EN_RESOLUCION, CANCELADA
+        EN_RESOLUCION → RESUELTA, CANCELADA
+        RESUELTA      → CERRADA
+        CERRADA / CANCELADA → (terminales, inmutables)
+    - No se permiten cambios si la incidencia está en estado terminal.
+    - Si se asigna un `componente_id`, debe existir y pertenecer al `despliegue_id`
+      efectivo (nuevo si se actualiza, o el actual).
+    """
+    inc = _get_or_404(db, Incidencia, incidencia_id, "Incidencia")
+
+    # Estado terminal: inmutable.
+    if inc.estado in _INCIDENCIA_ESTADOS_TERMINALES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"La incidencia está en estado terminal '{inc.estado.value}' "
+                f"y no admite más cambios."
+            ),
+        )
+
+    cambios = payload.campos_a_actualizar()
+    if not cambios:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se proporcionaron campos para actualizar.",
+        )
+
+    # Autorización específica para campos restringidos.
+    campos_restringidos = {"estado", "asignado_a_id"}
+    if campos_restringidos.intersection(cambios):
+        if current_user.rol not in {
+            RolUsuario.QA, RolUsuario.DESARROLLO, RolUsuario.JEFE_PROYECTO,
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cambiar {sorted(campos_restringidos)} requiere rol QA, DESARROLLO "
+                    f"o JEFE_PROYECTO. Su rol actual: '{current_user.rol.value}'."
+                ),
+            )
+
+    # State machine para el campo `estado`.
+    if "estado" in cambios:
+        _validar_transicion_estado(inc.estado, cambios["estado"])
+
+    # Validaciones de FK (orden importa: primero despliegue, luego componente).
+    if "asignado_a_id" in cambios and cambios["asignado_a_id"] is not None:
+        _get_or_404(db, Usuario, cambios["asignado_a_id"], "Usuario")
+
+    if "despliegue_id" in cambios and cambios["despliegue_id"] is not None:
+        _get_or_404(db, Despliegue, cambios["despliegue_id"], "Despliegue")
+
+    if "componente_id" in cambios and cambios["componente_id"] is not None:
+        comp = _get_or_404(db, Componente, cambios["componente_id"], "Componente")
+        # El despliegue efectivo (nuevo si se actualiza en el mismo PATCH, o el actual).
+        despliegue_efectivo = cambios.get("despliegue_id", inc.despliegue_id)
+        if comp.despliegue_id != despliegue_efectivo:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"El componente id={comp.id} pertenece al despliegue "
+                    f"id={comp.despliegue_id}, no al id={despliegue_efectivo}."
+                ),
+            )
+
+    # Aplicar cambios.
+    for campo, valor in cambios.items():
+        setattr(inc, campo, valor)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conflicto de integridad al actualizar la incidencia.",
+        ) from exc
+    db.refresh(inc)
+    return IncidenciaResponse.model_validate(inc)
 
 
 # =====================================================================
@@ -221,6 +471,7 @@ def crear_incidencia(
 def trazabilidad_despliegue(
     despliegue_id: int = Path(gt=0),
     db: Session = Depends(get_db),
+    _: Usuario = Depends(get_current_user),
 ) -> TrazabilidadDespliegue:
     stmt = (
         select(Despliegue)
@@ -272,7 +523,11 @@ def trazabilidad_despliegue(
     tags=["Usuarios"],
     summary="Registrar un nuevo usuario (Jefe de Proyecto, QA, Desarrollo, Negocio)",
 )
-def crear_usuario(payload: CrearUsuario, db: Session = Depends(get_db)) -> UsuarioResponse:
+def crear_usuario(
+    payload: CrearUsuario,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(require_role(RolUsuario.JEFE_PROYECTO)),
+) -> UsuarioResponse:
     u = Usuario(
         nombre=payload.nombre,
         email=payload.email,
@@ -286,43 +541,136 @@ def crear_usuario(payload: CrearUsuario, db: Session = Depends(get_db)) -> Usuar
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Email duplicado: {exc.orig}",
+            detail="Conflicto: ya existe un usuario con ese email.",
         ) from exc
     db.refresh(u)
     return UsuarioResponse.model_validate(u)
 
 
-@app.get("/usuarios/", response_model=List[UsuarioResponse], tags=["Usuarios"])
+@app.get(
+    "/usuarios/",
+    response_model=PaginatedResponse[UsuarioResponse],
+    tags=["Usuarios"],
+)
 def listar_usuarios(
-    skip: int = 0, limit: int = 50, db: Session = Depends(get_db),
-) -> List[UsuarioResponse]:
-    limit = min(max(limit, 1), 200)
+    page: int = Query(default=1, ge=1, description="Número de página (1-based)."),
+    page_size: int = Query(default=50, ge=1, le=200, description="Tamaño de página."),
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(get_current_user),
+) -> PaginatedResponse[UsuarioResponse]:
+    total = db.execute(select(func.count(Usuario.id))).scalar_one()
+    offset = (page - 1) * page_size
     rows = db.execute(
-        select(Usuario).order_by(Usuario.id.asc()).offset(skip).limit(limit)
+        select(Usuario).order_by(Usuario.id.asc()).offset(offset).limit(page_size)
     ).scalars().all()
-    return [UsuarioResponse.model_validate(u) for u in rows]
+    return PaginatedResponse[UsuarioResponse].build(
+        items=[UsuarioResponse.model_validate(u) for u in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-@app.get("/despliegues/", response_model=List[DespliegueResponse], tags=["Despliegues"])
+@app.get(
+    "/despliegues/",
+    response_model=PaginatedResponse[DespliegueResponse],
+    tags=["Despliegues"],
+)
 def listar_despliegues(
-    skip: int = 0, limit: int = 50, db: Session = Depends(get_db),
-) -> List[DespliegueResponse]:
-    limit = min(max(limit, 1), 200)
-    rows = db.execute(
-        select(Despliegue).order_by(Despliegue.id.desc()).offset(skip).limit(limit)
-    ).scalars().all()
-    return [DespliegueResponse.model_validate(d) for d in rows]
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    # Uso del Enum directamente: Pydantic valida y rechaza valores no permitidos (422).
+    estado: Optional[EstadoDespliegue] = Query(
+        default=None,
+        description="Filtra por estado exacto del despliegue.",
+    ),
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(get_current_user),
+) -> PaginatedResponse[DespliegueResponse]:
+    filtros = []
+    if estado is not None:
+        filtros.append(Despliegue.estado == estado)
+    where_clause = and_(*filtros) if filtros else None
+
+    count_stmt = select(func.count(Despliegue.id))
+    list_stmt = select(Despliegue).order_by(Despliegue.id.desc())
+    if where_clause is not None:
+        count_stmt = count_stmt.where(where_clause)
+        list_stmt = list_stmt.where(where_clause)
+
+    total = db.execute(count_stmt).scalar_one()
+    offset = (page - 1) * page_size
+    rows = db.execute(list_stmt.offset(offset).limit(page_size)).scalars().all()
+    return PaginatedResponse[DespliegueResponse].build(
+        items=[DespliegueResponse.model_validate(d) for d in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-@app.get("/incidencias/", response_model=List[IncidenciaResponse], tags=["Incidencias"])
+@app.get(
+    "/incidencias/",
+    response_model=PaginatedResponse[IncidenciaResponse],
+    tags=["Incidencias"],
+)
 def listar_incidencias(
-    skip: int = 0, limit: int = 50, db: Session = Depends(get_db),
-) -> List[IncidenciaResponse]:
-    limit = min(max(limit, 1), 200)
-    rows = db.execute(
-        select(Incidencia).order_by(Incidencia.id.desc()).offset(skip).limit(limit)
-    ).scalars().all()
-    return [IncidenciaResponse.model_validate(i) for i in rows]
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    estado: Optional[EstadoIncidencia] = Query(
+        default=None,
+        description="Filtra por estado exacto (Pydantic valida el enum).",
+    ),
+    severidad: Optional[SeveridadIncidencia] = Query(
+        default=None,
+        description="Filtra por severidad exacta (Pydantic valida el enum).",
+    ),
+    asignado_a_id: Optional[int] = Query(default=None, gt=0, description="Tickets asignados a un usuario."),
+    reportado_por_id: Optional[int] = Query(default=None, gt=0, description="Tickets reportados por un usuario."),
+    despliegue_id: Optional[int] = Query(default=None, gt=0, description="Tickets asociados a un despliegue."),
+    fecha_desde: Optional[datetime] = Query(default=None, description="ISO-8601; filtra fecha_deteccion >= fecha_desde."),
+    fecha_hasta: Optional[datetime] = Query(default=None, description="ISO-8601; filtra fecha_deteccion <= fecha_hasta."),
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(get_current_user),
+) -> PaginatedResponse[IncidenciaResponse]:
+    if fecha_desde is not None and fecha_hasta is not None and fecha_desde > fecha_hasta:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fecha_desde no puede ser mayor que fecha_hasta.",
+        )
+
+    filtros = []
+    if estado is not None:
+        filtros.append(Incidencia.estado == estado)
+    if severidad is not None:
+        filtros.append(Incidencia.severidad == severidad)
+    if asignado_a_id is not None:
+        filtros.append(Incidencia.asignado_a_id == asignado_a_id)
+    if reportado_por_id is not None:
+        filtros.append(Incidencia.reportado_por_id == reportado_por_id)
+    if despliegue_id is not None:
+        filtros.append(Incidencia.despliegue_id == despliegue_id)
+    if fecha_desde is not None:
+        filtros.append(Incidencia.fecha_deteccion >= fecha_desde)
+    if fecha_hasta is not None:
+        filtros.append(Incidencia.fecha_deteccion <= fecha_hasta)
+    where_clause = and_(*filtros) if filtros else None
+
+    count_stmt = select(func.count(Incidencia.id))
+    list_stmt = select(Incidencia).order_by(Incidencia.fecha_deteccion.desc())
+    if where_clause is not None:
+        count_stmt = count_stmt.where(where_clause)
+        list_stmt = list_stmt.where(where_clause)
+
+    total = db.execute(count_stmt).scalar_one()
+    offset = (page - 1) * page_size
+    rows = db.execute(list_stmt.offset(offset).limit(page_size)).scalars().all()
+    return PaginatedResponse[IncidenciaResponse].build(
+        items=[IncidenciaResponse.model_validate(i) for i in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 # =====================================================================

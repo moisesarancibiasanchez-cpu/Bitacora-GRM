@@ -1,11 +1,11 @@
 """
 app.schemas
 Modelos Pydantic v2 para validación de payloads de entrada/salida.
-Convención: CrearXxx (entrada) / XxxResponse (salida).
+Convención: CrearXxx (entrada) / XxxResponse (salida) / ActualizarXxx (PATCH).
 """
 from __future__ import annotations
 from datetime import datetime
-from typing import List, Optional
+from typing import Generic, List, Optional, TypeVar
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from app.models import (
     EstadoDespliegue, EstadoIncidencia,
@@ -98,15 +98,37 @@ class IncidenciaBase(BaseModel):
 
 
 class CrearIncidencia(IncidenciaBase):
+    """
+    El campo `reportado_por_id` ya NO viaja en el payload.
+    El servidor lo toma de la cabecera `X-User-Id` (ver get_current_user en main.py).
+    """
     despliegue_id: Optional[int] = Field(default=None, gt=0)
     componente_id: Optional[int] = Field(default=None, gt=0)
-    reportado_por_id: int = Field(gt=0)
 
     @model_validator(mode="after")
     def _componente_requiere_despliegue(self) -> "CrearIncidencia":
         if self.componente_id is not None and self.despliegue_id is None:
             raise ValueError("Si se indica 'componente_id' también debe indicarse 'despliegue_id'.")
         return self
+
+
+class ActualizarIncidencia(BaseModel):
+    """
+    PATCH semántico: todos los campos son opcionales. Solo se actualizan
+    los campos provistos (no nulos). El servidor controla la transición
+    de estado (no se permite 'saltar' a un estado final arbitrario).
+    """
+    titulo: Optional[str] = Field(default=None, min_length=5, max_length=200)
+    descripcion: Optional[str] = Field(default=None, min_length=10)
+    severidad: Optional[SeveridadIncidencia] = None
+    estado: Optional[EstadoIncidencia] = None
+    asignado_a_id: Optional[int] = Field(default=None, gt=0)
+    despliegue_id: Optional[int] = Field(default=None, gt=0)
+    componente_id: Optional[int] = Field(default=None, gt=0)
+
+    def campos_a_actualizar(self) -> dict:
+        """Devuelve solo los campos no nulos provistos."""
+        return self.model_dump(exclude_unset=True, exclude_none=True)
 
 
 class IncidenciaResponse(IncidenciaBase):
@@ -146,4 +168,29 @@ class TrazabilidadDespliegue(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "1.0.0"
+    environment: str
     timestamp: datetime
+
+
+# ===== PAGINACIÓN =====
+T = TypeVar("T")
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    """Envelope de paginación estándar para listados."""
+    items: List[T]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+    @classmethod
+    def build(cls, items: List[T], total: int, page: int, page_size: int) -> "PaginatedResponse[T]":
+        total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
+        return cls(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
