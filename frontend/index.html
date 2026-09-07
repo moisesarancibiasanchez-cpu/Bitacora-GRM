@@ -4,9 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Bitácora GRM — Núcleo ITSM Bancario</title>
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='10' fill='%230b2a4a'/><path d='M16 22h32M16 32h32M16 42h22' stroke='%23f5b800' stroke-width='3' stroke-linecap='round'/><circle cx='48' cy='42' r='4' fill='%23f5b800'/></svg>" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- =================== Top bar =================== -->
   <header class="topbar">
     <div class="brand">
       <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
@@ -16,118 +18,62 @@
       </svg>
       <div>
         <h1>Bitácora GRM</h1>
-        <p class="sub">Núcleo de Gestión de Despliegues e Incidencias · Banca</p>
+        <p class="sub">Gestión de Despliegues e Incidencias · Banca</p>
       </div>
     </div>
-    <nav class="nav">
-      <a href="#despliegues">Despliegues</a>
-      <a href="#incidencias">Incidencias</a>
-      <a href="#trazabilidad">Trazabilidad</a>
-      <a href="/docs" target="_blank" rel="noopener">API Docs</a>
-    </nav>
+    <div class="topbar__right">
+      <div class="health-pill" id="healthPill" title="Estado del backend">
+        <span class="dot"></span><span id="healthPillTxt">—</span>
+      </div>
+      <div class="user-box">
+        <label for="xUserId">X-User-Id</label>
+        <input id="xUserId" type="number" min="1" placeholder="ID" value="1" />
+      </div>
+    </div>
   </header>
 
-  <main class="container">
+  <!-- =================== Layout =================== -->
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <nav id="nav">
+        <a href="#dashboard"     data-route="dashboard">Dashboard</a>
+        <a href="#despliegues"   data-route="despliegues">Despliegues</a>
+        <a href="#componentes"   data-route="componentes">Componentes</a>
+        <a href="#incidencias"   data-route="incidencias">Incidencias</a>
+        <a href="#trazabilidad"  data-route="trazabilidad">Trazabilidad 360°</a>
+        <a href="#usuarios"      data-route="usuarios">Usuarios</a>
+        <a href="#api-docs"      data-route="api-docs">API Docs</a>
+      </nav>
+      <div class="sidebar__foot">
+        <span>v1.1.x · FastAPI + PostgreSQL</span>
+        <a href="https://github.com/moisesarancibiasanchez-cpu/Bitacora-GRM"
+           target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </aside>
 
-    <!-- Estado del sistema -->
-    <section class="card status" id="status">
-      <h2>Estado del sistema</h2>
-      <div id="health" class="health-box">Consultando…</div>
-    </section>
+    <!-- Main content -->
+    <main class="main" id="main">
+      <!-- Las vistas se renderizan aquí -->
+    </main>
+  </div>
 
-    <!-- Crear despliegue -->
-    <section class="card" id="despliegues">
-      <h2>1 · Registrar pase a producción</h2>
-      <p class="hint">Endpoint: <code>POST /despliegues/</code></p>
-      <form id="form-despliegue" class="grid">
-        <label>Código <input name="codigo" required pattern="[A-Z0-9_\-]+" value="DEP-2026-0001"/></label>
-        <label>Título <input name="titulo" required minlength="5" value="Pase a producción - Pagos"/></label>
-        <label>Fecha programada <input name="fecha_programada" type="datetime-local" required/></label>
-        <label>Solicitante ID <input name="solicitante_id" type="number" min="1" required value="1"/></label>
-        <label>Aprobador ID <input name="aprobador_id" type="number" min="1" required value="2"/></label>
-        <label class="full">Plan de rollback (mín. 20 chars)
-          <textarea name="plan_rollback" required minlength="20" rows="3">1) Detener servicio pagos-api. 2) Restaurar backup previo. 3) Reaplicar migración v3.</textarea>
-        </label>
-        <div class="full">
-          <button type="submit">Crear despliegue</button>
-        </div>
-      </form>
-      <pre class="out" id="out-despliegue">—</pre>
-    </section>
+  <!-- =================== Toasts =================== -->
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 
-    <!-- Agregar componente -->
-    <section class="card" id="componentes">
-      <h2>2 · Agregar artefacto técnico</h2>
-      <p class="hint">Endpoint: <code>POST /despliegues/{id}/componentes/</code></p>
-      <form id="form-componente" class="grid">
-        <label>Despliegue ID <input name="despliegue_id" type="number" min="1" required value="1"/></label>
-        <label>Nombre <input name="nombre" required value="migracion_pagos_v4.sql"/></label>
-        <label>Versión <input name="version" required value="4.1.0"/></label>
-        <label>Tipo
-          <select name="tipo">
-            <option>SCRIPT_SQL</option><option>SCRIPT_SHELL</option>
-            <option>BINARIO</option><option>CONFIGURACION</option>
-            <option>CONTENEDOR</option><option>OTRO</option>
-          </select>
-        </label>
-        <label class="full">Ruta de almacenamiento
-          <input name="ruta_almacenamiento" required value="s3://itsm-artifacts/sql/migracion_pagos_v4.sql"/>
-        </label>
-        <label class="full">Checksum SHA-256 (64 hex)
-          <input name="checksum_sha256" required pattern="[A-Fa-f0-9]{64}"
-                 value="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"/>
-        </label>
-        <div class="full">
-          <button type="submit">Agregar componente</button>
-        </div>
-      </form>
-      <pre class="out" id="out-componente">—</pre>
-    </section>
+  <!-- =================== Modal genérico =================== -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal__backdrop" data-modal-close></div>
+    <div class="modal__card" role="dialog" aria-modal="true">
+      <header class="modal__head">
+        <h3 id="modalTitle">Detalle</h3>
+        <button class="iconbtn" data-modal-close aria-label="Cerrar">×</button>
+      </header>
+      <div class="modal__body" id="modalBody"></div>
+    </div>
+  </div>
 
-    <!-- Crear incidencia -->
-    <section class="card" id="incidencias">
-      <h2>3 · Reportar incidencia (trazabilidad opcional)</h2>
-      <p class="hint">Endpoint: <code>POST /incidencias/</code></p>
-      <form id="form-incidencia" class="grid">
-        <label>Código <input name="codigo" required pattern="[A-Z0-9_\-]+" value="INC-2026-0001"/></label>
-        <label>Título <input name="titulo" required minlength="5" value="Error 500 en /pagos"/></label>
-        <label>Severidad
-          <select name="severidad"><option>BAJA</option><option>MEDIA</option>
-            <option selected>ALTA</option><option>CRITICA</option></select>
-        </label>
-        <label>Reportado por ID <input name="reportado_por_id" type="number" min="1" required value="4"/></label>
-        <label>Asignado a ID (opcional) <input name="asignado_a_id" type="number" min="1" value="3"/></label>
-        <label>Despliegue ID (opcional) <input name="despliegue_id" type="number" min="1" value="1"/></label>
-        <label>Componente ID (opcional) <input name="componente_id" type="number" min="1" value="1"/></label>
-        <label class="full">Descripción (mín. 10 chars)
-          <textarea name="descripcion" required minlength="10" rows="3">Desde las 09:12 el endpoint /pagos retorna HTTP 500.</textarea>
-        </label>
-        <div class="full">
-          <button type="submit">Crear incidencia</button>
-        </div>
-      </form>
-      <pre class="out" id="out-incidencia">—</pre>
-    </section>
-
-    <!-- Trazabilidad -->
-    <section class="card" id="trazabilidad">
-      <h2>4 · Trazabilidad 360°</h2>
-      <p class="hint">Endpoint: <code>GET /trazabilidad/despliegues/{id}</code></p>
-      <form id="form-trazabilidad" class="row">
-        <label>Despliegue ID <input name="despliegue_id" type="number" min="1" required value="1"/></label>
-        <button type="submit">Consultar</button>
-      </form>
-      <pre class="out" id="out-trazabilidad">—</pre>
-    </section>
-
-  </main>
-
-  <footer class="footer">
-    <p>Bitácora GRM · API REST sobre FastAPI + PostgreSQL · 2026</p>
-    <p class="muted">v1.0.0 · Trazabilidad e integridad transaccional para entorno bancario.</p>
-  </footer>
-
-  <script src="app.js"></script>
+  <script src="app.js" defer></script>
 
 <script>
 /**
