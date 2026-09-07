@@ -27,3 +27,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Archivos temporales y BDs de prueba
+tmp/
+*.db
+*.sqlite
+*.sqlite3

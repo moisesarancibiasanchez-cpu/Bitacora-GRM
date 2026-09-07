@@ -17,11 +17,13 @@ Mejoras Tier 1 (v1.1.0):
     - Helper `require_role()` para autorización por rol.
 """
 from __future__ import annotations
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -81,6 +83,23 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
+)
+
+# --------------------------- startup log ---------------------------
+# Logueamos el entorno al arrancar para que sea muy visible en los
+# logs de Railway si por accidente se está ejecutando como "dev" en
+# un entorno de producción.
+logger = logging.getLogger("bitacora_grm.startup")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(settings.log_level.upper() if hasattr(settings, "log_level") else "INFO")
+logger.info(
+    "Bitácora GRM v%s arrancando en entorno=%s | CORS=%s",
+    app.version,
+    settings.environment,
+    cors_allow_origins,
 )
 
 
@@ -209,22 +228,369 @@ def require_role(*roles: RolUsuario):
 # =====================================================================
 # 0 · Raíz y Health
 # =====================================================================
-@app.get("/", tags=["Sistema"], summary="Información del servicio y puntos de entrada")
-def root() -> dict:
+_HTML_ENV_BADGE_COLORS = {
+    "dev": ("#f59e0b", "#7c2d12"),     # ámbar
+    "staging": ("#3b82f6", "#1e3a8a"), # azul
+    "prod": ("#10b981", "#064e3b"),    # verde
+}
+
+
+@app.get("/", response_class=HTMLResponse, tags=["Sistema"], summary="Landing page del servicio")
+def root() -> HTMLResponse:
     """
-    Landing pública. Útil cuando se navega a la URL raíz del despliegue
-    (e.g. https://bitacora-grm.up.railway.app/) y para health checks
-    rápidos que esperan un 200.
+    Landing HTML del servicio. Sirve como punto de entrada amigable
+    cuando alguien navega a la URL raíz del despliegue.
+
+    Para consumir la información programáticamente, usar /openapi.json
+    o /health (que devuelven JSON).
     """
-    return {
-        "service": "Bitácora GRM — API",
-        "version": app.version,
-        "environment": settings.environment,
-        "docs": "/docs",
-        "redoc": "/redoc",
-        "openapi": "/openapi.json",
-        "health": "/health",
-    }
+    env = settings.environment
+    badge_bg, badge_fg = _HTML_ENV_BADGE_COLORS.get(env, ("#64748b", "#0f172a"))
+    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    version = app.version
+
+    html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Bitácora GRM — Sistema de Gestión de Despliegues e Incidencias para entorno bancario.">
+    <title>Bitácora GRM — API</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        :root {{
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --border: #e2e8f0;
+            --text: #0f172a;
+            --text-muted: #475569;
+            --primary: #0a2540;
+            --primary-hover: #1e3a5f;
+            --accent: #2563eb;
+            --accent-hover: #1d4ed8;
+            --success: #10b981;
+            --success-bg: #d1fae5;
+            --code-bg: #0f172a;
+            --code-fg: #e2e8f0;
+            --shadow: 0 1px 3px 0 rgba(0,0,0,.08), 0 1px 2px -1px rgba(0,0,0,.04);
+            --shadow-lg: 0 10px 25px -5px rgba(0,0,0,.08), 0 8px 10px -6px rgba(0,0,0,.04);
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+            padding: 2rem 1rem;
+        }}
+        .container {{ max-width: 1100px; margin: 0 auto; }}
+        header {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.75rem 2rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }}
+        .brand {{ display: flex; align-items: center; gap: 1rem; }}
+        .brand-icon {{
+            width: 48px; height: 48px;
+            background: var(--primary);
+            border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            color: #fff;
+        }}
+        .brand h1 {{
+            font-size: 1.5rem;
+            color: var(--primary);
+            font-weight: 700;
+            letter-spacing: -0.01em;
+        }}
+        .brand .tagline {{
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }}
+        .badges {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+        .badge {{
+            display: inline-flex; align-items: center;
+            padding: 0.375rem 0.75rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border-radius: 999px;
+            background: var(--border);
+            color: var(--text);
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }}
+        .badge.version {{ background: #e0e7ff; color: #3730a3; }}
+        .badge.env {{ background: {badge_bg}; color: {badge_fg}; }}
+        section {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem 2rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 1.5rem;
+        }}
+        section h2 {{
+            font-size: 0.8125rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+        }}
+        .status-row {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }}
+        .status-dot {{
+            width: 12px; height: 12px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 0 4px var(--success-bg);
+            animation: pulse 2s infinite;
+        }}
+        @keyframes pulse {{
+            0%, 100% {{ box-shadow: 0 0 0 4px var(--success-bg); }}
+            50%      {{ box-shadow: 0 0 0 8px rgba(16,185,129,0); }}
+        }}
+        .status-text {{ font-weight: 600; color: var(--text); }}
+        .status-sub {{ color: var(--text-muted); font-size: 0.875rem; }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+        }}
+        .link-card {{
+            display: flex; align-items: center; gap: 0.75rem;
+            padding: 1rem 1.25rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            text-decoration: none;
+            color: inherit;
+            transition: all .15s ease;
+        }}
+        .link-card:hover {{
+            border-color: var(--accent);
+            background: #f1f5f9;
+            transform: translateY(-1px);
+            box-shadow: var(--shadow-lg);
+        }}
+        .link-card svg {{ flex-shrink: 0; color: var(--accent); }}
+        .link-card .label {{ font-weight: 600; color: var(--text); }}
+        .link-card .path {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+        }}
+        .endpoint-list {{ list-style: none; display: grid; gap: 0.5rem; }}
+        .endpoint-row {{
+            display: flex; align-items: center; gap: 0.75rem;
+            padding: 0.625rem 0.875rem;
+            background: #f8fafc;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.8125rem;
+        }}
+        .method {{
+            display: inline-block;
+            min-width: 56px;
+            padding: 0.125rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 700;
+            font-size: 0.6875rem;
+            text-align: center;
+            color: #fff;
+        }}
+        .method.GET    {{ background: #0ea5e9; }}
+        .method.POST   {{ background: #10b981; }}
+        .method.PATCH  {{ background: #f59e0b; }}
+        .method.DELETE {{ background: #ef4444; }}
+        .endpoint-path {{ color: var(--text); font-weight: 500; }}
+        .endpoint-desc {{ color: var(--text-muted); font-size: 0.75rem; margin-left: auto; }}
+        details {{ margin-top: 1rem; }}
+        details summary {{
+            cursor: pointer; user-select: none;
+            color: var(--accent);
+            font-size: 0.875rem;
+            font-weight: 500;
+        }}
+        details summary:hover {{ text-decoration: underline; }}
+        pre.code {{
+            margin-top: 0.75rem;
+            background: var(--code-bg);
+            color: var(--code-fg);
+            padding: 1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.8125rem;
+            line-height: 1.5;
+        }}
+        footer {{
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.8125rem;
+            padding: 1rem 0 0;
+        }}
+        footer code {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: var(--border);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+        }}
+        @media (max-width: 640px) {{
+            body {{ padding: 1rem 0.75rem; }}
+            header, section {{ padding: 1.25rem 1rem; }}
+            .brand h1 {{ font-size: 1.25rem; }}
+            .endpoint-desc {{ display: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="brand">
+                <div class="brand-icon" aria-hidden="true">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2"/>
+                        <path d="M8 8h8M8 12h8M8 16h5"/>
+                    </svg>
+                </div>
+                <div>
+                    <h1>Bitácora GRM</h1>
+                    <p class="tagline">API de Gestión de Despliegues e Incidencias</p>
+                </div>
+            </div>
+            <div class="badges">
+                <span class="badge version">v{version}</span>
+                <span class="badge env">{env.upper()}</span>
+            </div>
+        </header>
+
+        <section>
+            <h2>Estado del servicio</h2>
+            <div class="status-row">
+                <span class="status-dot" aria-hidden="true"></span>
+                <div>
+                    <div class="status-text">Operacional</div>
+                    <div class="status-sub">API respondiendo · última verificación {now}</div>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <h2>Acceso rápido</h2>
+            <div class="grid">
+                <a href="/docs" class="link-card">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                    </svg>
+                    <div>
+                        <div class="label">Swagger UI</div>
+                        <div class="path">/docs</div>
+                    </div>
+                </a>
+                <a href="/redoc" class="link-card">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+                        <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+                    </svg>
+                    <div>
+                        <div class="label">ReDoc</div>
+                        <div class="path">/redoc</div>
+                    </div>
+                </a>
+                <a href="/openapi.json" class="link-card">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="16 18 22 12 16 6"/>
+                        <polyline points="8 6 2 12 8 18"/>
+                    </svg>
+                    <div>
+                        <div class="label">Esquema OpenAPI</div>
+                        <div class="path">/openapi.json</div>
+                    </div>
+                </a>
+                <a href="/health" class="link-card">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                    </svg>
+                    <div>
+                        <div class="label">Health Check</div>
+                        <div class="path">/health</div>
+                    </div>
+                </a>
+            </div>
+        </section>
+
+        <section>
+            <h2>Endpoints principales</h2>
+            <ul class="endpoint-list">
+                <li class="endpoint-row">
+                    <span class="method POST">POST</span>
+                    <span class="endpoint-path">/despliegues/</span>
+                    <span class="endpoint-desc">Registrar pase a producción</span>
+                </li>
+                <li class="endpoint-row">
+                    <span class="method POST">POST</span>
+                    <span class="endpoint-path">/despliegues/{{'{'}}id{{'}'}}/componentes/</span>
+                    <span class="endpoint-desc">Agregar artefacto técnico</span>
+                </li>
+                <li class="endpoint-row">
+                    <span class="method POST">POST</span>
+                    <span class="endpoint-path">/incidencias/</span>
+                    <span class="endpoint-desc">Reportar ticket</span>
+                </li>
+                <li class="endpoint-row">
+                    <span class="method PATCH">PATCH</span>
+                    <span class="endpoint-path">/incidencias/{{'{'}}id{{'}'}}</span>
+                    <span class="endpoint-desc">Actualizar incidencia</span>
+                </li>
+                <li class="endpoint-row">
+                    <span class="method GET">GET</span>
+                    <span class="endpoint-path">/trazabilidad/despliegues/{{'{'}}id{{'}'}}</span>
+                    <span class="endpoint-desc">Trazabilidad de despliegue</span>
+                </li>
+                <li class="endpoint-row">
+                    <span class="method GET">GET</span>
+                    <span class="endpoint-path">/usuarios/</span>
+                    <span class="endpoint-desc">Listar usuarios</span>
+                </li>
+            </ul>
+            <details>
+                <summary>¿Cómo autenticarme?</summary>
+                <pre class="code">curl -H "X-User-Id: 1" \\
+     https://&lt;tu-dominio&gt;.up.railway.app/incidencias/</pre>
+            </details>
+        </section>
+
+        <footer>
+            Bitácora GRM <code>v{version}</code> · Entorno <code>{env}</code> ·
+            FastAPI · SQLAlchemy · PostgreSQL
+        </footer>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Sistema"])

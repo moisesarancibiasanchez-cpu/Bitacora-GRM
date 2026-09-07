@@ -233,25 +233,78 @@ curl -H "X-User-Id: 1" "http://127.0.0.1:8000/incidencias/?estado=ABIERTA&severi
 
 ## ☁️ Despliegue en Railway
 
-1. **Crear proyecto** en <https://railway.com/new> → *Deploy from GitHub repo* → `Bitacora-GRM`.
-2. **Agregar plugin PostgreSQL** desde el dashboard.
-3. **Variables de entorno** (en *Variables* del servicio):
-   ```
-   DATABASE_URL = <URL que Railway asigna al plugin Postgres>
-   ENVIRONMENT  = prod
-   CORS_ORIGINS = https://tu-frontend.banco.local
-   LOG_LEVEL    = INFO
-   ```
-4. Railway detecta automáticamente `Procfile` y `railway.json`.
-5. **Inicializar el esquema** (opcional, en release phase):
-   ```bash
-   psql $DATABASE_URL < sql/01_schema.sql
-   psql $DATABASE_URL < sql/02_seed.sql
-   ```
+### 1. Crear proyecto
+
+1. Ir a <https://railway.com/new> → **Deploy from GitHub repo** → seleccionar `moisesarancibiasanchez-cpu/Bitacora-GRM`.
+2. **Agregar plugin PostgreSQL** desde *New* → *Database* → *PostgreSQL*.
+3. Copiar la `DATABASE_URL` que Railway inyecta automáticamente (visible en *Variables* del plugin).
+
+### 2. Variables de entorno (obligatorias)
+
+En el panel **Variables** del servicio Bitácora-GRM, definir:
+
+| Variable | Valor (producción) | Notas |
+|---|---|---|
+| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Referencia al plugin PostgreSQL |
+| `ENVIRONMENT` | `prod` | **Crítico**: nunca dejar `dev` en producción |
+| `CORS_ORIGINS` | `https://tu-dominio.com,https://www.tu-dominio.com` | Lista separada por comas, sin espacios |
+| `LOG_LEVEL` | `INFO` | `DEBUG` solo en staging |
+
+> Railway detecta automáticamente `Procfile` (`uvicorn app.main:app`) y
+> `railway.json` (NIXPACKS builder).
+
+### 3. Exponer el servicio
+
+El servicio arranca como privado. Para obtener una URL pública:
+
+*Panel del servicio* → **Settings** → **Networking** → **Public Networking** → **Generate Domain**.
+
+Esto produce una URL del tipo `https://bitacora-grm-production.up.railway.app`.
+
+### 4. Inicializar el esquema (opcional)
+
+Desde la pestaña **Console** del plugin PostgreSQL:
+
+```bash
+psql $DATABASE_URL < sql/01_schema.sql
+psql $DATABASE_URL < sql/02_seed.sql
+```
+
+### 5. Verificar el despliegue
+
+* **Landing HTML**: abrir la URL pública → debe mostrar la página de
+  Bitácora GRM con badge `prod` en verde. Si dice `dev`, las variables
+  no se inyectaron correctamente.
+* **Health check** (JSON): `GET /health` → debe devolver `{"status":"ok", "environment":"prod", ...}`.
+* **Logs de arranque**: en la pestaña *Logs* del servicio debe aparecer
+  una línea con el entorno detectado:
+  ```
+  [INFO] Bitácora GRM v1.1.0 arrancando en entorno=prod | CORS=['https://tu-dominio.com']
+  ```
+  Si dice `entorno=dev` o `CORS=['*']`, el despliegue está inseguro.
+
+### ⚠️ Seguridad: entorno mal configurado
+
+Si `GET /` o `GET /health` muestran `"environment":"dev"` después del
+despliegue, el servicio está ejecutándose con la política CORS permisiva.
+**Solución**: en Railway → *Variables*, asignar `ENVIRONMENT=prod` y
+`CORS_ORIGINS=https://...` y redeplegar (o esperar al redeploy automático
+al hacer *push*).
 
 ---
 
 ## 🧾 Changelog
+
+### v1.1.1 (Post-Tier 1 — UX & operabilidad)
+
+- 🌐 `GET /` ahora devuelve una **landing HTML** profesional con tema
+  bancario (azul corporativo, badge de entorno, lista de endpoints,
+  ejemplo de autenticación). Reemplaza al JSON plano anterior.
+- 📋 **Log de arranque** explícito: en los logs de Railway aparece el
+  entorno y la lista de orígenes CORS efectivos. Facilita detectar
+  despliegues accidentales en `dev`.
+- 🛡️ Eliminada la dependencia de `pydantic_settings.NoDecode` (compat
+  con `pydantic-settings<2.4`).
 
 ### v1.1.0 (Tier 1 — multi-usuario)
 
