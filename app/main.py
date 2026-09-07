@@ -70,8 +70,10 @@ app = FastAPI(
 # CORS: la política se valida en app.config.Settings._cors_segun_entorno.
 # - dev: si CORS_ORIGINS no se define o vale '*', se acepta cualquier origen.
 # - staging/prod: se exige al menos un origen http(s) explícito (nunca '*').
+# `cors_origins_list` es la propiedad de Settings que parsea el string
+# crudo `cors_origins` (e.g. "https://a,https://b") en una lista.
 cors_allow_origins = (
-    ["*"] if settings.environment == "dev" else settings.cors_origins
+    ["*"] if settings.environment == "dev" else settings.cors_origins_list
 )
 app.add_middleware(
     CORSMiddleware,

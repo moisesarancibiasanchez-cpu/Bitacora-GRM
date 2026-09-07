@@ -4,9 +4,9 @@ Configuración centralizada de Bitácora GRM.
 Sigue el principio 12-Factor (variables de entorno).
 """
 from functools import lru_cache
-from typing import Annotated, List
+from typing import List
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -35,12 +35,21 @@ class Settings(BaseSettings):
 
     # --- Seguridad ---
     # CORS_ORIGINS=https://app.banco.local,https://admin.banco.local
-    # `NoDecode` evita que pydantic-settings intente parsear el valor como JSON
-    # (lo que rompería con valores como "*" o "https://a,https://b") y deja
-    # que el field_validator `_parse_cors` lo descomponga en CSV.
-    cors_origins: Annotated[List[str], NoDecode] = Field(
-        default_factory=lambda: ["*"],
-        description="Lista de orígenes permitidos para CORS. Coma-separados.",
+    #
+    # Usamos `str` (no `List[str]`) a propósito: pydantic-settings intenta
+    # parsear como JSON cualquier tipo complejo (List, Dict) ANTES de
+    # invocar los field_validators, lo que rompe con valores como "*" o
+    # "https://a,https://b". Manteniendo el campo como `str` evitamos ese
+    # pre-procesado y la descomposición a lista se hace en
+    # `cors_origins_list`. Esto nos independiza de la anotación
+    # `NoDecode` (pydantic-settings >= 2.4) y funciona con cualquier
+    # versión >= 2.0.
+    cors_origins: str = Field(
+        default="*",
+        description=(
+            "Orígenes CORS separados por coma. "
+            "Use '*' para permitir cualquier origen (solo dev)."
+        ),
     )
     auth_header_name: str = Field(
         default="X-User-Id",
@@ -55,16 +64,29 @@ class Settings(BaseSettings):
             raise ValueError("environment debe ser uno de: dev, staging, prod")
         return v
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins")
     @classmethod
-    def _parse_cors(cls, v):
-        # Acepta string CSV, lista, o None. Pydantic-settings entrega un str
-        # cuando viene de variable de entorno.
+    def _normaliza_cors(cls, v: str) -> str:
+        """Normaliza el valor crudo. La descomposición a lista se hace en
+        `cors_origins_list` (property) para evitar el JSON-decoding que
+        pydantic-settings aplica a tipos complejos como List[str]."""
         if v is None:
+            return "*"
+        return v.strip()
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """
+        Devuelve la lista de orígenes parseada desde `cors_origins`.
+        - "" o None     -> ["*"]
+        - "*"           -> ["*"]
+        - "https://a,https://b" -> ["https://a", "https://b"]
+        """
+        raw = self.cors_origins
+        if not raw or raw.strip() == "*":
             return ["*"]
-        if isinstance(v, str):
-            v = [o.strip() for o in v.split(",") if o.strip()]
-        return list(v) if v else ["*"]
+        parsed = [o.strip() for o in raw.split(",") if o.strip()]
+        return parsed or ["*"]
 
     @model_validator(mode="after")
     def _cors_segun_entorno(self) -> "Settings":
@@ -77,7 +99,7 @@ class Settings(BaseSettings):
         abierta a cualquier origen.
         """
         env = self.environment
-        origins = self.cors_origins
+        origins = self.cors_origins_list
 
         if env in {"staging", "prod"}:
             if not origins or origins == ["*"]:
@@ -103,4 +125,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-
