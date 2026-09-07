@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
@@ -207,8 +207,26 @@ def require_role(*roles: RolUsuario):
 
 
 # =====================================================================
-# 0 · Health
+# 0 · Raíz y Health
 # =====================================================================
+@app.get("/", tags=["Sistema"], summary="Información del servicio y puntos de entrada")
+def root() -> dict:
+    """
+    Landing pública. Útil cuando se navega a la URL raíz del despliegue
+    (e.g. https://bitacora-grm.up.railway.app/) y para health checks
+    rápidos que esperan un 200.
+    """
+    return {
+        "service": "Bitácora GRM — API",
+        "version": app.version,
+        "environment": settings.environment,
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "openapi": "/openapi.json",
+        "health": "/health",
+    }
+
+
 @app.get("/health", response_model=HealthResponse, tags=["Sistema"])
 def health() -> HealthResponse:
     return HealthResponse(
@@ -217,6 +235,15 @@ def health() -> HealthResponse:
         environment=settings.environment,
         timestamp=datetime.now(tz=timezone.utc),
     )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    """
+    Favicon vacío para evitar el 404 que los navegadores disparan
+    automáticamente al cargar cualquier página de la API.
+    """
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # =====================================================================
